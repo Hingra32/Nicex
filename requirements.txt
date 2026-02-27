@@ -1,0 +1,8 @@
+pyTelegramBotAPI
+pymongo
+dnspython
+certifi
+Flask
+requests
+python-dotenv
+urllib3<2.0.0

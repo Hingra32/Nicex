@@ -987,7 +987,7 @@ def send_settings_panel(admin_id, msg_id_to_edit):
         types.InlineKeyboardButton("🔗 Edit Payment Link", callback_data="panel_payment_link"),
         types.InlineKeyboardButton("🔙 Back", callback_data="close_panel")
     )
-    bot.edit_message_text("*⚙️ Settings Menu*", admin_id, msg_id_to_edit, reply_markup=kb)
+    smart_edit(admin_id, msg_id_to_edit, "*⚙️ Settings Menu*", reply_markup=kb)
 
 # ---------------- ROUTER ----------------
 @bot.callback_query_handler(func=lambda c: True)
@@ -1492,6 +1492,15 @@ def router_callback(call):
             'files': files,
             'created_at': datetime.now()
         })
+
+        # Log to Data Channel
+        link_type_display = batch_type.capitalize()
+        log_text = (f"📂 *New Link Generated*\n"
+                    f"🔗 Code: `{code}`\n"
+                    f"👤 Owner: `{owner_id}`\n"
+                    f"🏷 Type: {link_type_display}\n"
+                    f"📁 Files: {len(files)}")
+        log_to_data_channel(log_text, files=files)
 
         # 4. Response Message
         if batch_type == "shortner_link":
@@ -2080,8 +2089,24 @@ def handle_inputs(message):
     # 1. USER REPLY TO ADMIN (Button Triggered)
     if isinstance(state, dict) and state.get('state') == 'waiting_user_reply':
         tid = state['tid']
-        content_summary = message.text or "[Media]"
         
+        # New Smart Media Logic
+        if message.text:
+            content_summary = message.text
+        else:
+            m_code = gen_code(4).upper()
+            content_summary = f"Media - #img_{m_code}"
+            
+            # Forward to User Log Channel
+            log_cid = LOG_CHANNELS.get("user")
+            if log_cid:
+                log_cap = (f"📸 *User Media Reply*\n\n"
+                           f"👤 From User: `{uid}`\n"
+                           f"🆔 Report: #{tid}\n"
+                           f"🔖 Code: #img_{m_code}")
+                try: bot.copy_message(log_cid, uid, message.message_id, caption=log_cap, parse_mode="Markdown")
+                except: pass
+
         # Save to Thread in DB
         tickets_col.update_one({"_id": tid}, {"$push": {"thread": {"role": "user", "msg": content_summary, "time": datetime.now()}}})
 
@@ -2238,7 +2263,23 @@ def handle_inputs(message):
             t = tickets_col.find_one({"_id": tid})
             
             if t:
-                content_summary = message.text or "[Media]"
+                # New Smart Admin Media Logic
+                if message.text:
+                    content_summary = message.text
+                else:
+                    m_code = gen_code(4).upper()
+                    content_summary = f"Media - #img_{m_code}"
+                    
+                    # Forward to Log Channel
+                    log_cid = LOG_CHANNELS.get("user")
+                    if log_cid:
+                        log_cap = (f"🤖 *Admin Media Response*\n\n"
+                                   f"🆔 Report: #{tid}\n"
+                                   f"👤 To User: `{t['user_id']}`\n"
+                                   f"🔖 Code: #img_{m_code}")
+                        try: bot.copy_message(log_cid, uid, message.message_id, caption=log_cap, parse_mode="Markdown")
+                        except: pass
+
                 # Save to Thread in DB
                 tickets_col.update_one({"_id": tid}, {"$push": {"thread": {"role": "admin", "msg": content_summary, "time": datetime.now()}}})
                 
@@ -2246,8 +2287,17 @@ def handle_inputs(message):
                 kb = types.InlineKeyboardMarkup()
                 kb.add(types.InlineKeyboardButton("↩️ Reply to Admin", callback_data=f"usr_reply|{tid}"))
                 reply_text = f"📩 *Admin Response (Report #{tid}):*\n\n{content_summary}"
-                bot.send_message(target_uid, reply_text, reply_markup=kb, parse_mode="Markdown")
-                if message.content_type != 'text': bot.copy_message(target_uid, uid, message.message_id, reply_markup=kb)
+                
+                # Combined Logic: Send single message with button
+                if message.content_type == 'text':
+                    bot.send_message(target_uid, reply_text, reply_markup=kb, parse_mode="Markdown")
+                else:
+                    # Use copy_message with a custom caption to send media + text + button together
+                    try:
+                        bot.copy_message(target_uid, uid, message.message_id, caption=reply_text, reply_markup=kb, parse_mode="Markdown")
+                    except:
+                        # Fallback if copy fails
+                        bot.send_message(target_uid, reply_text, reply_markup=kb, parse_mode="Markdown")
 
             smart_edit(state['chat_id'], state['msg_id'], f"✅ *Reply Sent to User for Report #{tid}*", reply_markup=None)
             time.sleep(1)
@@ -2315,13 +2365,36 @@ def handle_inputs(message):
             del user_states[uid]; return
         if st in ['waiting_log_data', 'waiting_log_user']:
             try:
-                cid = message.forward_from_chat.id if message.forward_from_chat else int(message.text)
+                # 1. Get Channel ID
+                if message.forward_from_chat:
+                    cid = message.forward_from_chat.id
+                else:
+                    try: cid = int(message.text.strip())
+                    except:
+                        bot.send_message(uid, "❌ *Invalid ID!* Please forward a message or send the numerical ID.")
+                        return
+
+                # 2. Check Admin Status (Try to send a test message)
+                try:
+                    test_msg = bot.send_message(cid, "✅ *Log Channel Setup Successful!*")
+                    # Delete test message after 2 seconds
+                    time.sleep(2)
+                    bot.delete_message(cid, test_msg.message_id)
+                except Exception as e:
+                    bot.send_message(uid, f"❌ *Bot is not an Admin!* Make sure the bot is an administrator in the channel with 'Post Messages' permission.\nError: `{e}`")
+                    return
+
+                # 3. Save
                 key = 'data' if st == 'waiting_log_data' else 'user'
                 LOG_CHANNELS[key] = cid
                 save_setting("logs", LOG_CHANNELS)
-                bot.send_message(uid, f"✅ Log Channel Set: `{cid}`")
-            except: pass
-            del user_states[uid]; return
+                bot.send_message(uid, f"✅ *{key.capitalize()} Log Channel Set!*\nID: `{cid}`")
+                
+            except Exception as e:
+                bot.send_message(uid, f"❌ *Error setting channel:* {e}")
+            
+            del user_states[uid]
+            return
         if st == 'waiting_tok_api_multi':
             idx = state['idx']
             # Temp save in state

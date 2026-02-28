@@ -33,12 +33,17 @@ except:
 if not BOT_TOKEN or not MONGO_URI:
     raise ValueError("❌ Error: BOT_TOKEN or MONGO_URI missing!")
 try:
-    client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+    # Connection Pooling: maxPoolSize=50 ensures 50 open connections for high traffic
+    client = pymongo.MongoClient(
+        MONGO_URI, 
+        tlsCAFile=certifi.where(),
+        maxPoolSize=50,
+        waitQueueTimeoutMS=5000
+    )
     db = client["TelegramBotDB"]
     # ... (existing collections)
     users_col = db["users"]
     batches_col = db["batches"]
-    tickets_col = db["tickets"]
     pro_proofs_col = db["pro_proofs"]
     settings_col = db["settings"]
     pending_payments_col = db["pending_payments"]
@@ -46,20 +51,22 @@ try:
     redeems_col = db["redeems"]
     auto_delete_col = db["auto_delete"]
     verification_tokens_col = db["verification_tokens"]
+    broadcasts_col = db["broadcasts"]
     
-    # Auto-delete code when expiry time is reached
+    # --- PERFORMANCE INDEXES ---
+    # 1. Search optimizations (Essential for 50k+ users)
+    users_col.create_index("premium_expiry")
+    users_col.create_index("verification_expiry")
+    unclaimed_payments_col.create_index("email")
+    batches_col.create_index("owner_id")
+    
+    # 2. TTL Indexes (Auto-cleanup)
     redeems_col.create_index("expiry", expireAfterSeconds=0)
-    
-    # Auto-delete pending email requests after 48 hours
     pending_payments_col.create_index("created_at", expireAfterSeconds=172800)
-    
-    # Auto-delete verification tokens after 20 minutes (1200 seconds)
     verification_tokens_col.create_index("created_at", expireAfterSeconds=1200)
+    broadcasts_col.create_index("expire_at", expireAfterSeconds=0)
     
-    # Auto-delete tickets at the end of the week
-    tickets_col.create_index("expire_at", expireAfterSeconds=0)
-    
-    print("✅ MongoDB Connected!")
+    print("✅ MongoDB Connected with Pooling & Indexes!")
 except Exception as e:
     print(f"❌ DB Error: {e}")
 
@@ -248,23 +255,22 @@ def webhook():
         return jsonify({"status": "error"}), 500
 # ---------------- IN-MEMORY STATE ----------------
 user_states = {}             
-user_support_state = {}      
-active_chats = {}            
-user_ticket_reply = {}       
 active_user_code = {}        
-last_broadcast_ids = []      
 
 # ---------------- SETTINGS MANAGER ----------------
 def get_setting(key, default):
     try:
         doc = settings_col.find_one({"_id": key})
         return doc["data"] if doc else default
-    except: return default
+    except Exception as e:
+        print(f"❌ DB Get Error ({key}): {e}")
+        return default
 
 def save_setting(key, data):
     try:
         settings_col.update_one({"_id": key}, {"$set": {"data": data}}, upsert=True)
-    except: pass
+    except Exception as e:
+        print(f"❌ DB Save Error ({key}): {e}")
 
 # Load Configs
 START_CONFIG = get_setting("start", {"text": "Hi {mention} ✨\nWelcome! Use buttons below.", "pic": None})
@@ -276,39 +282,32 @@ SHORTNER_CONFIG = get_setting("shortner", {"shorteners": [], "validity": 12, "ac
 CUSTOM_BTN_CONFIG = get_setting("custom_btn", {"text": None})
 PAYMENT_LINK = get_setting("payment_link", "https://superprofile.bio/vp/p-payment") # Admin Payment Link
 CREDIT_CONFIG = get_setting("credit", {"value": 1.0})
+CONTACT_LINK = get_setting("contact_link", "https://t.me/SupportBot")
 
 PLAN_DAYS = {"7": 7, "15": 15, "1M": 30, "6M": 180}
 
 # ---------------- HELPERS ----------------
+def escape_md(text):
+    if not text: return ""
+    # Escape markdown special characters
+    return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
 def smart_edit(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
     try:
         bot.edit_message_caption(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-    except Exception:
+    except Exception as e:
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception: pass
-
-def smart_edit_report(chat_id, message_id, text, photo=None, reply_markup=None):
-    # Use user screenshot or fallback to Admin Header (START_CONFIG["pic"])
-    target_media = photo if photo else START_CONFIG.get("pic")
-    
-    if target_media:
-        try:
-            # Smoothly swap media and update caption
-            bot.edit_message_media(
-                types.InputMediaPhoto(target_media, caption=text, parse_mode="Markdown"),
-                chat_id, message_id, reply_markup=reply_markup
-            )
-            return
         except Exception:
-            # If media swap fails (e.g., currently a text message), fallback to caption
+            # Fallback to plain text if Markdown fails
             try:
-                bot.edit_message_caption(text, chat_id, message_id, reply_markup=reply_markup, parse_mode="Markdown")
-                return
-            except Exception: pass
+                bot.edit_message_caption(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=None)
+            except Exception:
+                try:
+                    bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=None)
+                except Exception as e2:
+                    print(f"❌ Smart Edit Final Fail: {e2}")
 
-    # Absolute fallback to standard text/caption edit
-    smart_edit(chat_id, message_id, text, reply_markup)
 
 def save_user(user_id):
     try:
@@ -328,7 +327,8 @@ def save_user(user_id):
                 "support_reports": {"date": None, "count": 0}
             })
             log_to_user_channel(f"🆕 *New User Joined*\nID: `{user_id}`")
-    except: pass
+    except Exception as e:
+        print(f"❌ Save User Error: {e}")
 
 def get_credits(user_id):
     u = users_col.find_one({"_id": user_id})
@@ -351,7 +351,8 @@ def is_premium(user_id):
                 users_col.update_one({"_id": user_id}, {"$set": {"premium_expiry": None}})
                 return False
             return True
-    except: pass
+    except Exception as e:
+        print(f"❌ Premium Check Error: {e}")
     return False
 
 def get_premium_expiry(user_id):
@@ -362,12 +363,17 @@ def get_premium_expiry(user_id):
             if isinstance(u["premium_expiry"], datetime):
                 return u["premium_expiry"].strftime("%d-%b-%Y %I:%M %p")
             return str(u["premium_expiry"])
-    except: pass
+    except Exception as e:
+        print(f"❌ Get Premium Expiry Error: {e}")
     return "N/A"
 
 def set_premium(user_id, days):
-    expiry = datetime.now() + timedelta(days=days)
-    users_col.update_one({"_id": user_id}, {"$set": {"premium_expiry": expiry}})
+    try:
+        expiry = datetime.now() + timedelta(days=days)
+        users_col.update_one({"_id": user_id}, {"$set": {"premium_expiry": expiry}})
+        log_to_user_channel(f"💎 *New Premium User*\nID: `{user_id}`\nPlan: {days} Days\nExpiry: {expiry.strftime('%d-%b-%Y')}")
+    except Exception as e:
+        print(f"❌ Set Premium Error: {e}")
 
 def is_verified(user_id):
     if user_id == ADMIN_ID: return True
@@ -420,9 +426,11 @@ def check_force_join(user_id):
 
 # ---------------- LOGGING ----------------
 def log_to_data_channel(text, files=None):
-    cid = LOG_CHANNELS.get("data")
-    if not cid: return
     try:
+        settings = settings_col.find_one({"_id": "logs"})
+        cid = settings["data"]["data"] if settings and "data" in settings else None
+        if not cid: return
+        
         bot.send_message(cid, text)
         if files:
             for f in files:
@@ -435,9 +443,11 @@ def log_to_data_channel(text, files=None):
     except: pass
 
 def log_to_user_channel(text):
-    cid = LOG_CHANNELS.get("user")
-    if not cid: return
-    try: bot.send_message(cid, text)
+    try:
+        settings = settings_col.find_one({"_id": "logs"})
+        cid = settings["data"]["user"] if settings and "data" in settings else None
+        if not cid: return
+        bot.send_message(cid, text)
     except: pass
 
 # ---------------- CUSTOM BUTTON PARSER ----------------
@@ -455,7 +465,7 @@ def get_home_markup():
     )
     # Row 2: Two buttons
     markup.row(
-        types.InlineKeyboardButton("📞 Contact", callback_data="user_menu_supp"),
+        types.InlineKeyboardButton("📞 Contact", url=CONTACT_LINK),
         types.InlineKeyboardButton("Help ❓", callback_data="user_help_menu")
     )
     # Row 3 onwards: Single buttons
@@ -483,65 +493,6 @@ def get_custom_markup():
     return markup
 
 # ---------------- AUTO DELETE ----------------
-def render_panel_reports(chat_id, msg_id, page=1):
-    # Fetch from DB - Latest first
-    all_tickets = list(tickets_col.find().sort("created_at", -1))
-    count = len(all_tickets)
-
-    if count == 0:
-        smart_edit(chat_id, msg_id, "✅ *No Active Reports Found.*", reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 Back", callback_data="close_panel")))
-        return
-
-    per_page = 10
-    total_pages = max(1, (count + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-
-    start_idx = (page - 1) * per_page
-    current_tickets = all_tickets[start_idx : start_idx + per_page]
-
-    kb = types.InlineKeyboardMarkup()
-    
-    # 1. Reports Grid (2-2 per line)
-    row = []
-    for t in current_tickets:
-        row.append(types.InlineKeyboardButton(f"Report #{t['_id']}", callback_data=f"view_rep|{t['_id']}|{page}"))
-        if len(row) == 2:
-            kb.add(*row)
-            row = []
-    if row: kb.add(*row)
-
-    # 2. Navigation Row (Strict 8-button requirement)
-    nav_buttons = []
-    
-    # [⬅️] - Smart back
-    back_cb = "close_panel" if page == 1 else f"panel_reports|{page-1}"
-    nav_buttons.append(types.InlineKeyboardButton("⬅️", callback_data=back_cb))
-    
-    # [📑] - Page list
-    nav_buttons.append(types.InlineKeyboardButton("📑", callback_data=f"rep_page_list|{page}"))
-    
-    # [P1, P2, P3, P4] - Dynamic numbers starting from current page
-    for i in range(4):
-        p_num = page + i
-        if p_num <= total_pages:
-            nav_buttons.append(types.InlineKeyboardButton(str(p_num), callback_data=f"panel_reports|{p_num}"))
-        else:
-            # Placeholder to keep the row balanced if needed, or just stop
-            pass
-            
-    # [Last Page]
-    if total_pages > (page + 3):
-        nav_buttons.append(types.InlineKeyboardButton(str(total_pages), callback_data=f"panel_reports|{total_pages}"))
-    
-    # [➡️] - Next page
-    next_cb = f"panel_reports|{page+1}" if page < total_pages else "ignore"
-    nav_buttons.append(types.InlineKeyboardButton("➡️", callback_data=next_cb))
-    
-    kb.row(*nav_buttons)
-    kb.add(types.InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="close_panel"))
-
-    smart_edit_report(chat_id, msg_id, f"📋 *Active Reports: {count}*\n(Page {page}/{total_pages})\nSelect a report to view details:", reply_markup=kb)
-
 def schedule_delete(chat_id, message_ids):
     delay_mins = DELETE_CONFIG.get("minutes", 30)
     delete_at = datetime.now() + timedelta(minutes=delay_mins)
@@ -955,7 +906,6 @@ def send_admin_panel(admin_id, msg_id_to_edit=None):
     kb.add(
         types.InlineKeyboardButton("📢 Broadcast", callback_data="panel_broadcast"),
         types.InlineKeyboardButton("🎁 Redeem System", callback_data="panel_redeem"),
-        types.InlineKeyboardButton("📨 Reports", callback_data="panel_reports"),
         types.InlineKeyboardButton("📝 Log Channels", callback_data="panel_logs"),
         types.InlineKeyboardButton("⚙️ Settings", callback_data="panel_settings"),
         types.InlineKeyboardButton("📊 Status", callback_data="panel_stats")
@@ -963,12 +913,9 @@ def send_admin_panel(admin_id, msg_id_to_edit=None):
     text = "*🤖 Admin Control Panel*"
     
     if msg_id_to_edit:
-        smart_edit_report(admin_id, msg_id_to_edit, text, reply_markup=kb)
+        smart_edit(admin_id, msg_id_to_edit, text, reply_markup=kb)
     else:
-        if START_CONFIG.get("pic"):
-            bot.send_photo(admin_id, START_CONFIG["pic"], caption=text, reply_markup=kb)
-        else:
-            bot.send_message(admin_id, text, reply_markup=kb)
+        bot.send_message(admin_id, text, reply_markup=kb, parse_mode="Markdown")
 
 def send_settings_panel(admin_id, msg_id_to_edit):
     t_str = "30 Mins" if DELETE_CONFIG["minutes"] == 30 else "2 Hours"
@@ -985,6 +932,7 @@ def send_settings_panel(admin_id, msg_id_to_edit):
         types.InlineKeyboardButton("🚫 Ban/Unban", callback_data="panel_ban"),
         types.InlineKeyboardButton("💲 Edit Plans", callback_data="panel_plans"),
         types.InlineKeyboardButton("🔗 Edit Payment Link", callback_data="panel_payment_link"),
+        types.InlineKeyboardButton("📞 Contact Setup", callback_data="panel_contact_setup"),
         types.InlineKeyboardButton("🔙 Back", callback_data="close_panel")
     )
     smart_edit(admin_id, msg_id_to_edit, "*⚙️ Settings Menu*", reply_markup=kb)
@@ -1058,10 +1006,10 @@ def router_callback(call):
 
     # --- 5. CONTACT SUPPORT ---
     if action == "user_menu_supp":
-        user_support_state[uid] = True
         kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("🔙 Back / Cancel", callback_data="cancel_input_process"))
-        text = "📝 *Describe Your Issue:*\n\nPlease write your message or send a screenshot. Our support team will get back to you soon."
+        kb.add(types.InlineKeyboardButton("🚀 Go to Support Bot", url=CONTACT_LINK))
+        kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="user_main_back"))
+        text = "💬 *Support Center*\n\nPlease click the button below to reach our support team."
         smart_edit(chat_id, msg_id, text, reply_markup=kb)
         return
 
@@ -1264,7 +1212,6 @@ def router_callback(call):
 
     if action == "cancel_input_process":
         # 1. Clear States (Bot will no longer wait for message)
-        user_support_state.pop(uid, None)
         active_user_code.pop(uid, None)
         user_states.pop(uid, None)
         
@@ -1863,68 +1810,6 @@ def router_callback(call):
         user_states[uid] = {'state': 'waiting_log_user'}
         bot.send_message(uid, "Forward message from User Log Channel:")
 
-    # Reports
-    elif action.startswith("panel_reports"):
-        parts = action.split("|")
-        page = int(parts[1]) if len(parts) > 1 else 1
-        bot.answer_callback_query(call.id)
-        render_panel_reports(chat_id, msg_id, page)
-        return
-
-    elif action.startswith("rep_page_list|"):
-        page = int(action.split("|")[1])
-        count = tickets_col.count_documents({})
-        total_pages = max(1, (count + 9) // 10)
-
-        kb = types.InlineKeyboardMarkup()
-        row = []
-        for p in range(1, total_pages + 1):
-            row.append(types.InlineKeyboardButton(str(p), callback_data=f"panel_reports|{p}"))
-            if len(row) == 5:
-                kb.row(*row)
-                row = []
-        if row: kb.row(*row)
-        kb.add(types.InlineKeyboardButton("❌ Close", callback_data=f"panel_reports|{page}"))
-        smart_edit(chat_id, msg_id, f"📑 *Select a Page (Total: {total_pages})*", reply_markup=kb)
-        return
-
-    elif action.startswith("view_rep|"):
-        parts = action.split("|")
-        tid = parts[1]
-        page = parts[2] if len(parts) > 2 else "1"
-
-        t = tickets_col.find_one({"_id": tid})
-        if not t:
-            bot.answer_callback_query(call.id, "❌ Report not found or already fixed.", show_alert=True)
-            render_panel_reports(chat_id, msg_id, int(page))
-            return
-
-        kb = types.InlineKeyboardMarkup()
-        kb.add(
-            types.InlineKeyboardButton("✅ Fix", callback_data=f"fix|{tid}|{page}"),
-            types.InlineKeyboardButton("↩️ Reply", callback_data=f"reply|{tid}|{page}")
-        )
-        kb.add(types.InlineKeyboardButton("🔙 Back to Reports", callback_data=f"panel_reports|{page}"))
-
-        user_id = t.get('user_id', 'Unknown')
-        report_text = t.get('text', 'No Description Provided')
-        
-        # --- THREADING LOGIC ---
-        thread_content = ""
-        thread = t.get('thread', [])
-        for m in thread:
-            role = "👤 User" if m['role'] == 'user' else "🤖 Admin"
-            thread_content += f"\n\n━━━━━━━━━━━━━━━\n*{role}:*\n{m['msg']}"
-
-        txt = (f"🆔 *Report ID:* `#{tid}`\n"
-               f"👤 *UserID:* `{user_id}`\n\n"
-               f"📝 *Original Message:* \n{report_text}"
-               f"{thread_content}")
-
-        # Smooth Transition: No more delete and resend
-        smart_edit_report(chat_id, msg_id, txt, photo=t.get('photo'), reply_markup=kb)
-        return
-
     # Broadcast
     elif action == "panel_broadcast":
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -1941,6 +1826,18 @@ def router_callback(call):
         bot.answer_callback_query(call.id, "Deletion Started in Background.")
 
     # Settings
+    elif action == "panel_contact_setup":
+        user_states[uid] = {'state': 'waiting_contact_link'}
+        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_contact_setup"))
+        smart_edit(chat_id, msg_id, f"Current Link: `{CONTACT_LINK}`\n\nSend new Support Bot link (e.g. `https://t.me/SupportBot`):\n(Auto-cancels in 3 mins)", reply_markup=kb)
+        return
+
+    elif action == "cancel_contact_setup":
+        if uid in user_states: del user_states[uid]
+        bot.answer_callback_query(call.id, "❌ Setup Cancelled")
+        send_settings_panel(uid, msg_id)
+        return
+
     elif action == "panel_start_msg":
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("📝 Text", callback_data="st_text_menu"), types.InlineKeyboardButton("🖼 Pic", callback_data="st_pic_menu"), types.InlineKeyboardButton("🔙 Back", callback_data="panel_settings"))
@@ -1988,89 +1885,11 @@ def router_callback(call):
         smart_edit(chat_id, msg_id, f"Auto Delete Time: *{t_str}*", reply_markup=kb)
     elif action == "panel_stats":
         user_count = users_col.count_documents({})
-        reports_count = tickets_col.count_documents({})
         banned_count = users_col.count_documents({"is_banned": True})
         prem_count = users_col.count_documents({"premium_expiry": {"$gt": datetime.now()}})
         
-        msg = f"📊 *Bot Status*\n\n👥 Total Users: `{user_count}`\n📨 Reports: `{reports_count}`\n🚫 Banned: `{banned_count}`\n👑 Active Pro: `{prem_count}`"
+        msg = f"📊 *Bot Status*\n\n👥 Total Users: `{user_count}`\n🚫 Banned: `{banned_count}`\n👑 Active Pro: `{prem_count}`"
         bot.send_message(uid, msg)
-
-    # Actions
-    if action.startswith("fix|"):
-        parts = action.split("|")
-        tid = parts[1]
-        page = int(parts[2]) if len(parts) > 2 else 1
-        t = tickets_col.find_one({"_id": tid})
-        if t:
-            # 1. Notify User
-            try: bot.send_message(t['user_id'], f"✅ *Issue Resolved (Report #{tid})*\nYour report has been marked as fixed by our team. Thank you!", parse_mode="Markdown")
-            except: pass
-            
-            # 2. Cleanup DB (No garbage left)
-            tickets_col.delete_one({"_id": tid})
-            
-        bot.answer_callback_query(call.id, "✅ Ticket Fixed & Cleaned from DB!")
-        render_panel_reports(chat_id, msg_id, page)
-        return
-
-    if action.startswith("reply|"):
-        parts = action.split("|")
-        tid = parts[1]
-        page = parts[2] if len(parts) > 2 else "1"
-        t = tickets_col.find_one({"_id": tid})
-        
-        if t:
-            user_states[ADMIN_ID] = {'state': 'reply_ticket', 'uid': t['user_id'], 'tid': tid, 'page': page, 'msg_id': msg_id, 'chat_id': chat_id, 'time': datetime.now()}
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("❌ Cancel Reply", callback_data=f"cancel_reply_ticket|{tid}|{page}"))
-            smart_edit(chat_id, msg_id, f"✍️ *Reply to Report #{tid}:*\nType your message below (Auto-cancels in 3 mins):", reply_markup=kb)
-        return
-
-    # User Reply to Admin
-    if action.startswith("usr_reply|"):
-        tid = action.split("|")[1]
-        # Store original message content to restore it on cancel
-        orig_text = call.message.text or call.message.caption or f"📩 *Admin Response (Report #{tid})*"
-        
-        user_states[uid] = {
-            'state': 'waiting_user_reply', 
-            'tid': tid, 
-            'msg_id': msg_id, 
-            'chat_id': chat_id, 
-            'time': datetime.now(),
-            'orig_text': orig_text
-        }
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("❌ Cancel Reply", callback_data=f"cancel_user_reply_ticket|{tid}"))
-        smart_edit(chat_id, msg_id, "✍️ *Type your reply to Admin:*\n(Auto-cancels in 3 mins)", reply_markup=kb)
-        return
-
-    if action.startswith("cancel_reply_ticket|"):
-        bot.answer_callback_query(call.id, "❌ Reply Cancelled", show_alert=False)
-        parts = action.split("|")
-        tid = parts[1]
-        page = parts[2] if len(parts) > 2 else "1"
-        
-        if uid in user_states: del user_states[uid]
-        # Fake callback to restore view_rep perfectly via smooth logic 
-        call.data = f"view_rep|{tid}|{page}"
-        router_callback(call)
-        return
-        
-    if action.startswith("cancel_user_reply_ticket|"):
-        bot.answer_callback_query(call.id, "❌ Reply Cancelled", show_alert=False)
-        tid = action.split("|")[1]
-        
-        # Restore original menu and stop waiting
-        state = user_states.get(uid)
-        orig_text = state.get('orig_text') if state else f"📩 *Admin Response (Report #{tid})*"
-        
-        if uid in user_states: del user_states[uid]
-        
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("↩️ Reply to Admin", callback_data=f"usr_reply|{tid}"))
-        smart_edit(chat_id, msg_id, orig_text, reply_markup=kb)
-        return
 
 # ---------------- INPUT HANDLERS ----------------
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'animation', 'voice'])
@@ -2079,122 +1898,6 @@ def handle_inputs(message):
     if is_banned(uid): return
 
     state = user_states.get(uid)
-    
-    # 3-Minute Timeout Auto-Cancel (No Response)
-    if isinstance(state, dict) and state.get('state') in ['waiting_user_reply', 'reply_ticket']:
-        if 'time' in state and (datetime.now() - state['time']).total_seconds() > 180:
-            del user_states[uid]
-            state = None # Let it process as a normal message
-
-    # 1. USER REPLY TO ADMIN (Button Triggered)
-    if isinstance(state, dict) and state.get('state') == 'waiting_user_reply':
-        tid = state['tid']
-        
-        # New Smart Media Logic
-        if message.text:
-            content_summary = message.text
-        else:
-            m_code = gen_code(4).upper()
-            content_summary = f"Media - #img_{m_code}"
-            
-            # Forward to User Log Channel
-            log_cid = LOG_CHANNELS.get("user")
-            if log_cid:
-                log_cap = (f"📸 *User Media Reply*\n\n"
-                           f"👤 From User: `{uid}`\n"
-                           f"🆔 Report: #{tid}\n"
-                           f"🔖 Code: #img_{m_code}")
-                try: bot.copy_message(log_cid, uid, message.message_id, caption=log_cap, parse_mode="Markdown")
-                except: pass
-
-        # Save to Thread in DB
-        tickets_col.update_one({"_id": tid}, {"$push": {"thread": {"role": "user", "msg": content_summary, "time": datetime.now()}}})
-
-        # Calculate Page Number for Admin Notification
-        all_tickets = list(tickets_col.find().sort("created_at", -1))
-        ticket_index = next((i for i, t in enumerate(all_tickets) if t['_id'] == tid), 0)
-        page_num = (ticket_index // 10) + 1
-
-        # Notify Admin concisely
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("👁 View Report", callback_data=f"view_rep|{tid}|{page_num}"))
-        bot.send_message(ADMIN_ID, f"📩 *New Reply for Report #{tid}*\nLocated on Page: {page_num}", reply_markup=kb)
-        
-        # Smooth edit: Success message for user
-        success_msg = f"✔️ *Reply successfully sent to Admin for Report #{tid}*"
-        smart_edit(state['chat_id'], state['msg_id'], success_msg, reply_markup=None)
-        
-        del user_states[uid]
-        return
-
-    # 2. SUPPORT REQUEST (Initial Ticket)
-    if uid in user_support_state:
-        # --- USERNAME CHECK ---
-        username = message.from_user.username
-        if not username:
-            bot.send_message(uid, "🚫 *Access Denied*\n\nReport bhejne ke liye aapka *Telegram Username* set hona zaroori hai.\n\nSettings mein jaakar ek username banayein aur phir try karein.")
-            del user_support_state[uid]
-            return
-
-        del user_support_state[uid]
-        
-        # --- RATE LIMIT CHECK (3 reports per 24h) ---
-        u = users_col.find_one({"_id": uid})
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        sr = u.get("support_reports", {"date": None, "count": 0})
-        
-        if sr["date"] == today_str:
-            if sr["count"] >= 3:
-                bot.send_message(uid, "🚫 *Daily Limit Reached*\n\nYou have already sent 3 reports today.")
-                return
-            new_count = sr["count"] + 1
-        else:
-            new_count = 1
-            
-        users_col.update_one({"_id": uid}, {"$set": {"support_reports": {"date": today_str, "count": new_count}}})
-
-        # --- PERSISTENT ALL-TIME COUNTER ---
-        stats = settings_col.find_one_and_update(
-            {"_id": "report_stats"},
-            {"$inc": {"total_ever": 1}},
-            upsert=True,
-            return_document=pymongo.ReturnDocument.AFTER
-        )
-        total_ever = stats.get("total_ever", 1)
-
-        # --- GENERATE READABLE TID ---
-        # Sanitize username (Remove symbols like _, keep first 10 chars)
-        clean_name = re.sub(r'[^a-zA-Z0-9]', '', username)[:10].lower()
-        tid = f"{clean_name}{total_ever}"
-        
-        txt = message.caption or message.text or "No Text"
-        pid = message.photo[-1].file_id if message.photo else None
-        
-        now = datetime.now()
-        # Find next Sunday 23:59:59
-        days_ahead = 6 - now.weekday()
-        if days_ahead < 0: days_ahead += 7
-        next_sunday = now + timedelta(days=days_ahead)
-        expire_at = datetime.combine(next_sunday, datetime.max.time())
-        
-        # Save to DB
-        tickets_col.insert_one({
-            '_id': tid, 
-            'user_id': uid, 
-            'text': txt, 
-            'photo': pid, 
-            'status': 'open',
-            'thread': [],
-            'created_at': now,
-            'expire_at': expire_at
-        })
-        
-        # Notify Admin
-        bot.send_message(ADMIN_ID, f"⚠️ *New Report #{tid}* from @{username}\nCheck Admin Panel -> Reports", parse_mode="Markdown")
-        
-        # Confirm to User
-        bot.send_message(uid, f"✅ *Report #{tid} Submitted!*\n\nOur team will get back to you soon.", parse_mode="Markdown")
-        return
 
      # Text Input Logic (Admin Link Update - Ye same rahega)
     if user_states.get(uid) == "WAIT_PAYMENT_LINK" and uid == ADMIN_ID:
@@ -2205,6 +1908,15 @@ def handle_inputs(message):
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="panel_settings"))
         bot.send_message(uid, f"✅ *Payment Link Updated:*\n`{message.text}`", reply_markup=kb)
+        return
+
+    if user_states.get(uid) == {'state': 'waiting_contact_link'} and uid == ADMIN_ID:
+        global CONTACT_LINK
+        CONTACT_LINK = message.text
+        save_setting("contact_link", message.text)
+        del user_states[uid]
+        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 Back", callback_data="panel_settings"))
+        bot.send_message(uid, f"✅ *Support Bot Link Updated:*\n`{message.text}`", reply_markup=kb)
         return
 
             # Process pending payments email (Strict Logic: Only if PENDING)
@@ -2257,81 +1969,11 @@ def handle_inputs(message):
     if isinstance(state, dict) and uid == ADMIN_ID:
         st = state['state']
 
-        if st == 'reply_ticket':
-            tid = state['tid']
-            page = int(state.get('page', 1))
-            t = tickets_col.find_one({"_id": tid})
-            
-            if t:
-                # New Smart Admin Media Logic
-                if message.text:
-                    content_summary = message.text
-                else:
-                    m_code = gen_code(4).upper()
-                    content_summary = f"Media - #img_{m_code}"
-                    
-                    # Forward to Log Channel
-                    log_cid = LOG_CHANNELS.get("user")
-                    if log_cid:
-                        log_cap = (f"🤖 *Admin Media Response*\n\n"
-                                   f"🆔 Report: #{tid}\n"
-                                   f"👤 To User: `{t['user_id']}`\n"
-                                   f"🔖 Code: #img_{m_code}")
-                        try: bot.copy_message(log_cid, uid, message.message_id, caption=log_cap, parse_mode="Markdown")
-                        except: pass
-
-                # Save to Thread in DB
-                tickets_col.update_one({"_id": tid}, {"$push": {"thread": {"role": "admin", "msg": content_summary, "time": datetime.now()}}})
-                
-                target_uid = t['user_id']
-                kb = types.InlineKeyboardMarkup()
-                kb.add(types.InlineKeyboardButton("↩️ Reply to Admin", callback_data=f"usr_reply|{tid}"))
-                reply_text = f"📩 *Admin Response (Report #{tid}):*\n\n{content_summary}"
-                
-                # Combined Logic: Send single message with button
-                if message.content_type == 'text':
-                    bot.send_message(target_uid, reply_text, reply_markup=kb, parse_mode="Markdown")
-                else:
-                    # Use copy_message with a custom caption to send media + text + button together
-                    try:
-                        bot.copy_message(target_uid, uid, message.message_id, caption=reply_text, reply_markup=kb, parse_mode="Markdown")
-                    except:
-                        # Fallback if copy fails
-                        bot.send_message(target_uid, reply_text, reply_markup=kb, parse_mode="Markdown")
-
-            smart_edit(state['chat_id'], state['msg_id'], f"✅ *Reply Sent to User for Report #{tid}*", reply_markup=None)
-            time.sleep(1)
-            render_panel_reports(state['chat_id'], state['msg_id'], page)
-            del user_states[uid]
-            return
-
         if st == 'broadcast_input':
             target = state.get('target')
-
-            # Count users
-            total_users = users_col.count_documents({})
-            if target == 'prem':
-                users = users_col.find({"premium_expiry": {"$gt": datetime.now()}})
-            else:
-                users = users_col.find({})
-
-            sent_msg = bot.send_message(ADMIN_ID, f"🚀 Broadcasting to ~{total_users} users...")
-            count = 0
-
-            for u in users:
-                try:
-                    m = None
-                    if message.content_type == 'text': m = bot.send_message(u["_id"], message.text)
-                    elif message.content_type == 'photo': m = bot.send_photo(u["_id"], message.photo[-1].file_id, caption=message.caption)
-                    elif message.content_type == 'video': m = bot.send_video(u["_id"], message.video.file_id, caption=message.caption)
-                    elif message.content_type == 'document': m = bot.send_document(u["_id"], message.document.file_id, caption=message.caption)
-
-                    if m: last_broadcast_ids.append((u["_id"], m.message_id, datetime.now()))
-                    count += 1
-                    time.sleep(0.04) # Rate limit
-                except: pass
-
-            bot.edit_message_text(f"✅ Broadcast Complete: {count} users.", ADMIN_ID, sent_msg.message_id)
+            # Move the heavy loop to a background thread to prevent Render timeouts
+            threading.Thread(target=perform_real_broadcast, args=(uid, message, target)).start()
+            bot.send_message(uid, "🚀 *Broadcast Started in Background!*\nBot will notify you once complete.")
             del user_states[uid]
             return
 
@@ -2678,6 +2320,48 @@ def handle_inputs(message):
             del active_user_code[uid]
             return
 
+def perform_real_broadcast(admin_id, message, target):
+    try:
+        # Calculate Next Sunday 11:59:59 PM for DB auto-delete
+        now = datetime.now()
+        days_until_sunday = 6 - now.weekday()
+        if days_until_sunday < 0: days_until_sunday += 7
+        next_sunday = now + timedelta(days=days_until_sunday)
+        expire_at = datetime.combine(next_sunday, datetime.max.time())
+
+        # Count users
+        if target == 'prem':
+            users = list(users_col.find({"premium_expiry": {"$gt": now}}))
+        else:
+            users = list(users_col.find({}))
+
+        sent_msg = bot.send_message(admin_id, f"🚀 Broadcasting to users...")
+        count = 0
+
+        for u in users:
+            try:
+                m = None
+                if message.content_type == 'text': m = bot.send_message(u["_id"], message.text)
+                elif message.content_type == 'photo': m = bot.send_photo(u["_id"], message.photo[-1].file_id, caption=message.caption)
+                elif message.video: m = bot.send_video(u["_id"], message.video.file_id, caption=message.caption)
+                elif message.document: m = bot.send_document(u["_id"], message.document.file_id, caption=message.caption)
+
+                if m:
+                    # Store in DB for auto-delete by MongoDB
+                    broadcasts_col.insert_one({
+                        "chat_id": u["_id"],
+                        "message_id": m.message_id,
+                        "created_at": now,
+                        "expire_at": expire_at
+                    })
+                count += 1
+                time.sleep(0.04) # Rate limit
+            except: pass
+
+        bot.send_message(admin_id, f"✅ *Broadcast Complete*\nTotal Users Reached: `{count}`\n\n🗑 *Note:* These messages will be automatically deleted on Sunday midnight.")
+    except Exception as e:
+        bot.send_message(admin_id, f"❌ *Broadcast Error:* {e}")
+
 def done_kb():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("✅ DONE", callback_data="batch_save"))
@@ -2689,15 +2373,18 @@ def perform_broadcast_delete(admin_id, action):
     if "1h" in action: cutoff -= timedelta(hours=1)
     elif "12h" in action: cutoff -= timedelta(hours=12)
     else: cutoff -= timedelta(days=365) 
+    
     count = 0
-    # Copy list to iterate safely
-    for i, (uid, mid, ts) in enumerate(list(last_broadcast_ids)):
-        if ts > cutoff:
-            try: bot.delete_message(uid, mid); count += 1
-            except: pass
-            # Remove from original list (using value, not index to be safe)
-            try: last_broadcast_ids.remove((uid, mid, ts))
-            except: pass
+    # Fetch from DB instead of RAM
+    pending_deletes = list(broadcasts_col.find({"created_at": {"$gt": cutoff}}))
+    
+    for item in pending_deletes:
+        try:
+            bot.delete_message(item['chat_id'], item['message_id'])
+            count += 1
+            # Remove from DB after successful manual delete
+            broadcasts_col.delete_one({"_id": item['_id']})
+        except: pass
 
     bot.send_message(admin_id, f"🗑 Deleted {count} messages.")
 
